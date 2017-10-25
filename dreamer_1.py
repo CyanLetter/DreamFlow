@@ -29,6 +29,46 @@ def deprocess(net, img):
 def objective_L2(dst):
     dst.diff[:] = dst.data 
 
+#objective for guided dreaming
+def objective_guide(dst,guide_features):
+    x = dst.data[0].copy()
+    y = guide_features
+    ch = x.shape[0]
+    x = x.reshape(ch,-1)
+    y = y.reshape(ch,-1)
+    A = x.T.dot(y) # compute the matrix of dot-products with guide features
+    dst.diff[0].reshape(ch,-1)[:] = y[:,A.argmax(1)] # select ones that match best
+
+#from https://github.com/jrosebr1/bat-country/blob/master/batcountry/batcountry.py
+def prepare_guide(net, image, end="inception_4c/output", maxW=224, maxH=224):
+        # grab dimensions of input image
+        (w, h) = image.size
+
+        # GoogLeNet was trained on images with maximum width and heights
+        # of 224 pixels -- if either dimension is larger than 224 pixels,
+        # then we'll need to do some resizing
+        if h > maxH or w > maxW:
+            # resize based on width
+            if w > h:
+                r = maxW / float(w)
+
+            # resize based on height
+            else:
+                r = maxH / float(h)
+
+            # resize the image
+            (nW, nH) = (int(r * w), int(r * h))
+            image = np.float32(image.resize((nW, nH), PIL.Image.BILINEAR))
+
+        (src, dst) = (net.blobs["data"], net.blobs[end])
+        src.reshape(1, 3, nH, nW)
+        src.data[0] = preprocess(net, image)
+        net.forward(end=end)
+        guide_features = dst.data[0].copy()
+
+        return guide_features
+
+
 def make_step(net, step_size=1.5, end='inception_4c/output', 
               jitter=32, clip=True, objective=objective_L2):
     '''Basic gradient ascent step.'''
@@ -82,6 +122,72 @@ def deepdream(net, base_img, iter_n=4, octave_n=5, octave_scale=1.4, end='incept
             print octave, i, end, vis.shape
             clear_output(wait=True)
             
+        # extract details produced on the current octave
+        detail = src.data[0]-octave_base
+    # returning the resulting image
+    return deprocess(net, src.data[0])
+
+# --------------
+# Guided Dreaming
+# --------------
+def make_step_guided(net, step_size=1.5, end='inception_4c/output',
+              jitter=32, clip=True, objective_fn=objective_guide, **objective_params):
+    '''Basic gradient ascent step.'''
+
+    #if objective_fn is None:
+    #    objective_fn = objective_L2
+
+    src = net.blobs['data'] # input image is stored in Net's 'data' blob
+    dst = net.blobs[end]
+
+    ox, oy = np.random.randint(-jitter, jitter+1, 2)
+    src.data[0] = np.roll(np.roll(src.data[0], ox, -1), oy, -2) # apply jitter shift
+
+    net.forward(end=end)
+    objective_fn(dst, **objective_params)  # specify the optimization objective
+    net.backward(start=end)
+    g = src.diff[0]
+    # apply normalized ascent step to the input image
+    src.data[:] += step_size/np.abs(g).mean() * g
+
+    src.data[0] = np.roll(np.roll(src.data[0], -ox, -1), -oy, -2) # unshift image
+
+    if clip:
+        bias = net.transformer.mean['data']
+        src.data[:] = np.clip(src.data, -bias, 255-bias)
+
+def deepdream_guided(net, base_img, iter_n=10, octave_n=4, octave_scale=1.4, end='inception_4c/output', clip=True, objective_fn=objective_guide, **step_params):
+
+    #if objective_fn is None:
+    #    objective_fn = objective_L2
+
+    # prepare base images for all octaves
+    octaves = [preprocess(net, base_img)]
+    for i in xrange(octave_n-1):
+        octaves.append(nd.zoom(octaves[-1], (1, 1.0/octave_scale,1.0/octave_scale), order=1))
+
+    src = net.blobs['data']
+    detail = np.zeros_like(octaves[-1]) # allocate image for network-produced details
+    for octave, octave_base in enumerate(octaves[::-1]):
+        h, w = octave_base.shape[-2:]
+        if octave > 0:
+            # upscale details from the previous octave
+            h1, w1 = detail.shape[-2:]
+            detail = nd.zoom(detail, (1, 1.0*h/h1,1.0*w/w1), order=1)
+
+        src.reshape(1,3,h,w) # resize the network's input image size
+        src.data[0] = octave_base+detail
+        for i in xrange(iter_n):
+            make_step_guided(net, end=end, clip=clip, objective_fn=objective_fn, **step_params)
+
+            # visualization
+            vis = deprocess(net, src.data[0])
+            if not clip: # adjust image contrast if clipping is disabled
+                vis = vis*(255.0/np.percentile(vis, 99.98))
+            showarray(vis)
+            print octave, i, end, vis.shape
+            clear_output(wait=True)
+
         # extract details produced on the current octave
         detail = src.data[0]-octave_base
     # returning the resulting image
@@ -158,7 +264,16 @@ def main(input, output, model_path, model_name, octaves, octave_scale, iteration
         print("display turned on")
     img = np.float32(PIL.Image.open(input + '/%08d.png' % (frame_i) ))
     h,w,c = img.shape
-    hallu = deepdream(net, img, iter_n = iterations, step_size = stepsize, octave_n = octaves, octave_scale = octave_scale, jitter=jitter, end = layers)
+
+    #Choosing between normal dreaming, and guided dreaming
+    if guide_image is None:
+        hallu = deepdream(net, img, iter_n = iterations, step_size = stepsize, octave_n = octaves, octave_scale = octave_scale, jitter=jitter, end = layers)
+    else:
+        guide = np.float32(PIL.Image.open(guide_image))
+        print('Setting up Guide with selected image')
+        guide_features = prepare_guide(net,PIL.Image.open(guide_image), end=layers)
+        hallu = deepdream_guided(net, img, iter_n = iterations, step_size = stepsize, octave_n = octaves, octave_scale = octave_scale, jitter=jitter, end = layers, objective_fn=objective_guide, guide_features=guide_features)
+
     np.clip(hallu, 0, 255, out=hallu)
     PIL.Image.fromarray(np.uint8(hallu)).save(output + '/%08d.png' % (frame_i) )
     grayImg = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
@@ -177,16 +292,22 @@ def main(input, output, model_path, model_name, octaves, octave_scale, iteration
         halludiff = hallu - previousImg
         halludiff = cv2.remap(halludiff, flow, None, cv2.INTER_LINEAR)   
         hallu = img + halludiff
-        hallu = deepdream(net, hallu, iter_n = iterations, step_size = stepsize, octave_n = octaves, octave_scale = octave_scale, jitter=jitter, end = layers)
+        if guide_image is None:
+            hallu = deepdream(net, hallu, iter_n = iterations, step_size = stepsize, octave_n = octaves, octave_scale = octave_scale, jitter=jitter, end = layers)
+        else:
+            guide = np.float32(PIL.Image.open(guide_image))
+            print('Setting up Guide with selected image')
+            guide_features = prepare_guide(net,PIL.Image.open(guide_image), end=layers)
+            hallu = deepdream_guided(net, hallu, iter_n = iterations, step_size = stepsize, octave_n = octaves, octave_scale = octave_scale, jitter=jitter, end = layers, objective_fn=objective_guide, guide_features=guide_features)
         np.clip(hallu, 0, 255, out=hallu)
         PIL.Image.fromarray(np.uint8(hallu)).save(output + '/%08d.png' % (i+1))
 
-        if blend_at > 1 - blend_step: blend_forward = False
-        elif blend_at <= 0.5: blend_forward = True
-        if blend_forward: blend_at += blend_step
-        else: blend_at -= blend_step
-        blendval = blend_at
-        # blendval = 0.3
+        # if blend_at > 1 - blend_step: blend_forward = False
+        # elif blend_at <= 0.5: blend_forward = True
+        # if blend_forward: blend_at += blend_step
+        # else: blend_at -= blend_step
+        # blendval = blend_at
+        blendval = 0.5
     img = morphPicture(input + '/%08d.png' % (i+1), output + '/%08d.png' % (i), blendval)
 
 if __name__ == "__main__":
